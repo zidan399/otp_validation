@@ -1,0 +1,7 @@
+node_modules
+dist
+build
+
+GEMINI.md
+*.log
+*.env
