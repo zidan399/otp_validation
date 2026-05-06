@@ -14,8 +14,9 @@ app.use(cors({
 }));
 
 // Routes
-app.post("/api/login", ipRateLimiter, authController.requestOtp);
-app.post("/api/verify", ipRateLimiter, authController.verifyOtp);
+app.post("/api/login", authController.requestOtp);
+app.post("/api/verify", authController.verifyOtp);
+app.post("/api/notify-block", authController.notifyBlock);
 
 // Garbage Collector (Cleanup Memory)
 setInterval(

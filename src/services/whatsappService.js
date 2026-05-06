@@ -12,7 +12,8 @@ exports.sendWhatsAppMessage = async (phone, text) => {
   };
 
   try {
-    await axios.post(
+    console.log(`[Evolution API] Attempting to send message to ${phone}...`);
+    const response = await axios.post(
       `${process.env.EVOLUTION_URL}/message/sendText/${process.env.INSTANCE_NAME}`,
       payload,
       {
@@ -22,6 +23,7 @@ exports.sendWhatsAppMessage = async (phone, text) => {
         },
       },
     );
+    console.log(`[Evolution API] Message sent successfully to ${phone}. ID: ${response.data?.key?.id}`);
     return true;
   } catch (error) {
     logger.error({ error: error.response?.data || error.message }, "[Evolution API Error]");
