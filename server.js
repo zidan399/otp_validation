@@ -17,6 +17,7 @@ app.use(cors({
 app.post("/api/login", authController.requestOtp);
 app.post("/api/verify", authController.verifyOtp);
 app.post("/api/notify-block", authController.notifyBlock);
+app.post("/api/notify", authController.sendNotification);
 
 // Garbage Collector (Cleanup Memory)
 setInterval(

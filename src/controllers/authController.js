@@ -274,6 +274,30 @@ exports.notifyBlock = async (req, res) => {
   return res.json({ success: !!sent });
 };
 
+exports.sendNotification = async (req, res) => {
+  const { token, message } = req.body;
+  if (!token || !message) return sendError(res, 400, "Token and message required.");
+
+  let decoded;
+  try {
+    const secret = process.env.OTP_JWT_SECRET || process.env.JWT_SECRET || "default_otp_secret";
+    decoded = jwt.verify(token, secret);
+  } catch (err) {
+    console.error("[OTP Service] JWT Verification Error (sendNotification):", err.message);
+    return sendError(res, 401, "Invalid or expired authorization token.");
+  }
+
+  const phone = sanitizePhone(decoded.phone);
+  if (!phone) return sendError(res, 400, "Invalid phone format in token.");
+
+  console.log(`[OTP Service] sendNotification request received for ${phone}.`);
+
+  const sent = await sendWhatsAppMessage(phone, message);
+
+  console.log(`[OTP Service] sendNotification WhatsApp status for ${phone}: ${sent ? 'SUCCESS' : 'FAILED'}`);
+  return res.json({ success: !!sent });
+};
+
 // Export the stores
 exports.userStore = userStore;
 exports.ipStore = ipStore;
