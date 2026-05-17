@@ -24,9 +24,34 @@ exports.sendWhatsAppMessage = async (phone, text) => {
       },
     );
     console.log(`[Evolution API] Message sent successfully to ${phone}. ID: ${response.data?.key?.id}`);
-    return true;
+    return { success: true };
   } catch (error) {
-    logger.error({ error: error.response?.data || error.message }, "[Evolution API Error]");
-    return false;
+    const errorData = error.response?.data;
+    const errorMsg = (errorData?.message || errorData?.error || error.message || "").toLowerCase();
+    
+    console.error(`[Evolution API Error] Details:`, {
+      status: error.response?.status,
+      message: errorMsg,
+      data: errorData
+    });
+
+    const notOnWhatsApp = [
+      "not on whatsapp",
+      "invalid jid",
+      "does not exist",
+      "not registered",
+      "user not found",
+      "recipient not found",
+      "account not found",
+      "number not found",
+      "unavailable",
+      "disconnected",
+      "not connected",
+    ];
+    if (error.response?.status === 404 || notOnWhatsApp.some(p => errorMsg.includes(p))) {
+      return { success: false, error: "NOT_ON_WHATSAPP" };
+    }
+    
+    return { success: false, error: "GATEWAY_ERROR" };
   }
 };

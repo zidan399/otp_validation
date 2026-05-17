@@ -21,7 +21,8 @@ exports.requestOtp = async (req, res) => {
       maxAttempts: decoded.maxAttempts,
       maxAttemptsIp: decoded.maxAttemptsIp,
       blockDurations: decoded.blockDurations,
-      otpExpiryMinutes: decoded.otpExpiryMinutes
+      otpExpiryMinutes: decoded.otpExpiryMinutes,
+      messageHeader: decoded.messageHeader,
     });
   } catch (err) {
     console.error("[OTP Service] JWT Verification Error:", err.message);
@@ -37,6 +38,7 @@ exports.requestOtp = async (req, res) => {
   const blockDurations = decoded.blockDurations || [30, 60, 1440];
   const maxRequests = decoded.maxRequests || 3;
   const otpExpiryMinutes = decoded.otpExpiryMinutes || 2;
+  const messageHeader = decoded.messageHeader || "ReNile";
 
   const now = Date.now();
 
@@ -84,7 +86,7 @@ exports.requestOtp = async (req, res) => {
 
     await sendWhatsAppMessage(
       phone,
-      `*ReNile* 🛡️\nMultiple OTP requests detected. Account temporarily blocked for ${blockMsg}.\n\nتم اكتشاف طلبات متعددة لرمز التحقق. تم حظر الحساب مؤقتًا لمدة ${hours >= 1 ? (hours === 24 ? 'يوم' : 'ساعة') : 'دقائق'}.`,
+      `*${messageHeader}* 🛡️\nMultiple OTP requests detected. Account temporarily blocked for ${blockMsg}.\n\nتم اكتشاف طلبات متعددة لرمز التحقق. تم حظر الحساب مؤقتًا لمدة ${hours >= 1 ? (hours === 24 ? 'يوم' : 'ساعة') : 'دقائق'}.`,
     );
     return sendError(res, 403, `Too many requests. Blocked for ${blockMsg}.`);
   }
@@ -98,14 +100,20 @@ exports.requestOtp = async (req, res) => {
 
   console.log(`[OTP Service] Generated OTP for ${phone}. Expires at: ${record.expiresAt} (in ${otpExpiryMinutes}m)`);
 
-  const sent = await sendWhatsAppMessage(
+  const sendResult = await sendWhatsAppMessage(
     phone,
-    `*ReNile OTP* 🔑\nYour login code is: *${otp}*\nValid for 2 minutes.\n\nرمز تسجيل الدخول الخاص بك هو: *${otp}*\nصالح لمدة دقيقتين.`,
+    `*${messageHeader}* 🔑\nYour login code is: *${otp}*\nValid for 2 minutes.\n\nرمز تسجيل الدخول الخاص بك هو: *${otp}*\nصالح لمدة دقيقتين.`,
   );
 
-  return sent
-    ? res.json({ success: true, message: "OTP sent." })
-    : sendError(res, 500, "Failed to send.");
+  if (sendResult.success) {
+    userStore[phone] = record;
+    return res.json({ success: true, message: "OTP sent." });
+  } else {
+    if (sendResult.error === "NOT_ON_WHATSAPP") {
+      return sendError(res, 400, "The number is not on WhatsApp. Please create an account first.");
+    }
+    return sendError(res, 500, "Failed to send.");
+  }
 };
 
 exports.verifyOtp = async (req, res) => {
@@ -136,6 +144,7 @@ exports.verifyOtp = async (req, res) => {
   const maxAttempts = decoded.maxAttempts || 3;
   const maxAttemptsIp = decoded.maxAttemptsIp || 20;
   const blockDurations = decoded.blockDurations || [30, 60, 1440];
+  const messageHeader = decoded.messageHeader || "ReNile";
 
   const record = userStore[phone];
   const now = Date.now(); // Get current time
@@ -223,7 +232,7 @@ exports.verifyOtp = async (req, res) => {
 
       await sendWhatsAppMessage(
         phone,
-        `*ReNile* 🛡️\nToo many failed login attempts. Account blocked for ${blockMsg}.\n\nتم استنفاد محاولات تسجيل الدخول. تم حظر الحساب لمدة ${hours >= 1 ? (hours === 24 ? 'يوم' : 'ساعة') : 'دقائق'}.`,
+        `*${messageHeader}* 🛡️\nToo many failed login attempts. Account blocked for ${blockMsg}.\n\nتم استنفاد محاولات تسجيل الدخول. تم حظر الحساب لمدة ${hours >= 1 ? (hours === 24 ? 'يوم' : 'ساعة') : 'دقائق'}.`,
       );
       return sendError(res, 403, `Blocked for ${blockMsg}.`);
     }
@@ -247,6 +256,7 @@ exports.notifyBlock = async (req, res) => {
   const phone = sanitizePhone(decoded.phone);
   if (!phone) return sendError(res, 400, "Invalid phone format in token.");
 
+  const messageHeader = decoded.messageHeader || "ReNile";
   const hours = durationMinutes / 60;
   const blockMsg = hours >= 1 
     ? `${hours} hour${hours > 1 ? 's' : ''}` 
@@ -267,7 +277,7 @@ exports.notifyBlock = async (req, res) => {
 
   const sent = await sendWhatsAppMessage(
     phone,
-    `*ReNile* 🛡️\nSecurity Alert: Your account has been temporarily blocked for ${blockMsg} due to suspicious activity.\n\nتنبيه أمني: تم حظر حسابك مؤقتًا لمدة ${arTimeStr} بسبب نشاط مشبوه.`,
+    `*${messageHeader}* 🛡️\nSecurity Alert: Your account has been temporarily blocked for ${blockMsg} due to suspicious activity.\n\nتنبيه أمني: تم حظر حسابك مؤقتًا لمدة ${arTimeStr} بسبب نشاط مشبوه.`,
   );
 
   console.log(`[OTP Service] notifyBlock WhatsApp status for ${phone}: ${sent ? 'SUCCESS' : 'FAILED'}`);
