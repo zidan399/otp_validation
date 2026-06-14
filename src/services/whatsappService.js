@@ -27,13 +27,32 @@ exports.sendWhatsAppMessage = async (phone, text) => {
     return { success: true };
   } catch (error) {
     const errorData = error.response?.data;
-    const errorMsg = (errorData?.message || errorData?.error || error.message || "").toLowerCase();
     
-    console.error(`[Evolution API Error] Details:`, {
+    // Convert error message to string safely
+    let errorMsg = "";
+    const rawMessage = errorData?.response?.message || errorData?.message;
+    
+    if (typeof rawMessage === "string") {
+      errorMsg = rawMessage;
+    } else if (rawMessage) {
+      errorMsg = JSON.stringify(rawMessage);
+    } else {
+      errorMsg = errorData?.error || error.message || "";
+    }
+    errorMsg = errorMsg.toLowerCase();
+    
+    // Use JSON.stringify(..., null, 2) to see the full content of Arrays in the console
+    console.error(`[Evolution API Error] Details:`, JSON.stringify({
       status: error.response?.status,
       message: errorMsg,
       data: errorData
-    });
+    }, null, 2));
+
+    // Check for explicit 'exists: false' from Evolution API (checking both paths)
+    const explicitlyNotOnWA = 
+      errorData?.response?.message?.[0]?.exists === false || 
+      errorData?.message?.[0]?.exists === false || 
+      errorData?.exists === false;
 
     const notOnWhatsApp = [
       "not on whatsapp",
@@ -48,7 +67,12 @@ exports.sendWhatsAppMessage = async (phone, text) => {
       "disconnected",
       "not connected",
     ];
-    if (error.response?.status === 404 || notOnWhatsApp.some(p => errorMsg.includes(p))) {
+
+    if (
+      error.response?.status === 404 || 
+      explicitlyNotOnWA || 
+      notOnWhatsApp.some(p => errorMsg.includes(p))
+    ) {
       return { success: false, error: "NOT_ON_WHATSAPP" };
     }
     

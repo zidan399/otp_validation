@@ -33,10 +33,10 @@ exports.requestOtp = async (req, res) => {
   if (!phone) return sendError(res, 400, "Invalid phone format in token.");
 
   // DYNAMIC CONFIG FROM BACKEND (with fallbacks)
-  const maxAttempts = decoded.maxAttempts || 3;
+  const maxAttempts = decoded.maxAttempts || 5;
   const maxAttemptsIp = decoded.maxAttemptsIp || 20;
-  const blockDurations = decoded.blockDurations || [30, 60, 1440];
-  const maxRequests = decoded.maxRequests || 3;
+  const blockDurations = decoded.blockDurations || [15, 30, 180];
+  const maxRequests = decoded.maxRequests || 5;
   const otpExpiryMinutes = decoded.otpExpiryMinutes || 2;
   const messageHeader = decoded.messageHeader || "ReNile";
 

@@ -3,7 +3,6 @@ const express = require("express");
 const cors = require("cors");
 const pino = require("pino")();
 const authController = require("./src/controllers/authController.js");
-const { ipRateLimiter } = require("./src/middleware/rateLimiter");
 
 const app = express();
 app.set("trust proxy", 1);
