@@ -1,313 +1,377 @@
 const jwt = require("jsonwebtoken");
+const config = require("../config");
 const { sanitizePhone } = require("../helpers/sanitizer");
 const { generateOTP, isSecureEqual } = require("../helpers/security");
 const { sendError } = require("../helpers/response");
+const { logger, maskPhone } = require("../helpers/logger");
 const { sendWhatsAppMessage } = require("../services/whatsappService");
 
-const userStore = {}; // Memory Store for phones
-const ipStore = {};   // Memory Store for IPs
+/**
+ * OTP issuing and verification.
+ *
+ * Both stores are in-memory and per-process: codes and blocks are lost on
+ * restart, and running two copies of this service would give each its own view.
+ * That is a known limitation (see Readme) — it does not affect channel
+ * rotation, which is stateless with respect to these records.
+ */
+const userStore = {}; // keyed by sanitized phone
+const ipStore = {}; // keyed by client IP, only when the caller identifies one
+
+const FALLBACKS = {
+  requestOtp: { maxRequests: 5, blockDurations: [15, 30, 180], otpExpiryMinutes: 2 },
+  verifyOtp: { maxAttempts: 3, maxAttemptsIp: 20, blockDurations: [30, 60, 1440] },
+  messageHeader: "ReNile",
+};
+
+// --- helpers -----------------------------------------------------------------
+
+/** Verifies the backend's service-to-service token and returns its claims. */
+function decodeToken(token, context) {
+  try {
+    return { decoded: jwt.verify(token, config.otpJwtSecret) };
+  } catch (error) {
+    logger.error({ context, error: error.message }, "[OTP] Token verification failed");
+    return { error: "Invalid or expired authorization token." };
+  }
+}
+
+/**
+ * The client's IP, or null.
+ *
+ * `req.ip` is NOT usable here: every request arrives from the Nojo backend, so
+ * req.ip is the backend's address for all users at once. Applying IP limits to
+ * it would let twenty wrong codes from twenty different farmers block the
+ * twenty-first — a self-inflicted outage. So IP rules only apply when the
+ * caller explicitly forwards the real client IP.
+ */
+function clientIpOf(req, decoded) {
+  const forwarded = decoded?.clientIp || req.get("x-client-ip");
+  return typeof forwarded === "string" && forwarded.trim() ? forwarded.trim() : null;
+}
+
+function ipRecordOf(ip) {
+  if (!ip) return null;
+  if (!ipStore[ip]) ipStore[ip] = { attempts: 0, blockedUntil: null, blockCount: 0, lastActivityAt: 0 };
+  ipStore[ip].lastActivityAt = Date.now();
+  return ipStore[ip];
+}
+
+/** Renders a block duration for both languages. */
+function describeDuration(durationMinutes) {
+  const hours = durationMinutes / 60;
+
+  if (hours >= 1) {
+    const en = `${hours} hour${hours > 1 ? "s" : ""}`;
+    if (hours === 24) return { en, ar: "يوم كامل" };
+    if (hours === 1) return { en, ar: "ساعة واحدة" };
+    return { en, ar: `${hours} ساعات` };
+  }
+
+  const en = `${durationMinutes} minutes`;
+  if (durationMinutes === 1) return { en, ar: "دقيقة واحدة" };
+  if (durationMinutes === 2) return { en, ar: "دقيقتين" };
+  return { en, ar: `${durationMinutes} دقائق` };
+}
+
+/**
+ * Applies the next progressive block to a record and returns its duration.
+ * Each successive block is longer, up to the last configured step.
+ */
+function applyBlock(record, blockDurations) {
+  const blockIndex = Math.min(record.blockCount || 0, blockDurations.length - 1);
+  const durationMinutes = blockDurations[blockIndex];
+
+  record.blockedUntil = Date.now() + durationMinutes * 60 * 1000;
+  record.blockCount = (record.blockCount || 0) + 1;
+
+  return durationMinutes;
+}
+
+/** True when a record is currently blocked; sends the 403 if so. */
+function rejectIfBlocked(res, record, label) {
+  if (!record || !record.blockedUntil || Date.now() >= record.blockedUntil) return false;
+  const minutesLeft = Math.ceil((record.blockedUntil - Date.now()) / 60000);
+  sendError(res, 403, `${label} Try again in ${minutesLeft} mins.`);
+  return true;
+}
+
+// --- handlers ----------------------------------------------------------------
 
 exports.requestOtp = async (req, res) => {
   const { token } = req.body;
-  const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-
   if (!token) return sendError(res, 401, "Authorization token required.");
 
-  let decoded;
-  try {
-    const secret = process.env.OTP_JWT_SECRET || process.env.JWT_SECRET || "default_otp_secret";
-    decoded = jwt.verify(token, secret);
-    console.log(`[OTP Service] Received dynamic config from Backend:`, {
-      maxAttempts: decoded.maxAttempts,
-      maxAttemptsIp: decoded.maxAttemptsIp,
-      blockDurations: decoded.blockDurations,
-      otpExpiryMinutes: decoded.otpExpiryMinutes,
-      messageHeader: decoded.messageHeader,
-    });
-  } catch (err) {
-    console.error("[OTP Service] JWT Verification Error:", err.message);
-    return sendError(res, 401, "Invalid or expired authorization token.");
-  }
+  const { decoded, error } = decodeToken(token, "requestOtp");
+  if (error) return sendError(res, 401, error);
 
   const phone = sanitizePhone(decoded.phone);
   if (!phone) return sendError(res, 400, "Invalid phone format in token.");
 
-  // DYNAMIC CONFIG FROM BACKEND (with fallbacks)
-  const maxAttempts = decoded.maxAttempts || 5;
-  const maxAttemptsIp = decoded.maxAttemptsIp || 20;
-  const blockDurations = decoded.blockDurations || [15, 30, 180];
-  const maxRequests = decoded.maxRequests || 5;
-  const otpExpiryMinutes = decoded.otpExpiryMinutes || 2;
-  const messageHeader = decoded.messageHeader || "ReNile";
+  // Security policy is owned by the backend and travels in the token, so the
+  // two services can't drift apart. These fallbacks only apply to old tokens.
+  const maxRequests = decoded.maxRequests || FALLBACKS.requestOtp.maxRequests;
+  const blockDurations = decoded.blockDurations || FALLBACKS.requestOtp.blockDurations;
+  const otpExpiryMinutes = decoded.otpExpiryMinutes || FALLBACKS.requestOtp.otpExpiryMinutes;
+  const messageHeader = decoded.messageHeader || FALLBACKS.messageHeader;
 
   const now = Date.now();
+  const ip = clientIpOf(req, decoded);
 
-  // 1. CHECK IP BLOCK
-  let ipRecord = ipStore[ip] || { attempts: 0, blockedUntil: null, blockCount: 0 };
-  if (ipRecord.blockedUntil && now < ipRecord.blockedUntil) {
-    const mins = Math.ceil((ipRecord.blockedUntil - now) / 60000);
-    return sendError(res, 403, `IP Blocked. Try again in ${mins} mins.`);
-  }
+  if (rejectIfBlocked(res, ipRecordOf(ip), "IP blocked.")) return;
 
-  // 2. CHECK PHONE BLOCK
-  let record = userStore[phone] || {
-    code: null,
-    expiresAt: null,
-    requests: 0,
-    attempts: 0,
-    blockedUntil: null,
-    blockCount: 0,
-  };
+  // Created only after the IP check, so a rejected request doesn't leave an
+  // empty record behind that the cleanup pass would never collect.
+  const record =
+    userStore[phone] ||
+    (userStore[phone] = {
+      code: null,
+      expiresAt: null,
+      requests: 0,
+      attempts: 0,
+      blockedUntil: null,
+      blockCount: 0,
+      lastFailedCode: null,
+    });
 
-  if (record.blockedUntil && now < record.blockedUntil) {
-    const minutesLeft = Math.ceil((record.blockedUntil - now) / 60000);
-    return sendError(
-      res,
-      403,
-      `Blocked. Try again in ${minutesLeft} mins.`,
-    );
-  }
+  if (rejectIfBlocked(res, record, "Blocked.")) return;
 
   if (record.requests >= maxRequests) {
-    // Progressive Block Calculation
-    const blockIndex = Math.min(record.blockCount, blockDurations.length - 1);
-    const durationMinutes = blockDurations[blockIndex];
-    const blockTimeMs = durationMinutes * 60 * 1000;
-
-    record.blockedUntil = now + blockTimeMs;
+    const durationMinutes = applyBlock(record, blockDurations);
     record.requests = 0;
-    record.blockCount += 1; // Increment block count for next time
-    userStore[phone] = record;
+    const duration = describeDuration(durationMinutes);
 
-    const hours = durationMinutes / 60;
-    const blockMsg = hours >= 1 
-      ? `${hours} hour${hours > 1 ? 's' : ''}` 
-      : `${durationMinutes} minutes`;
+    logger.warn(
+      { phone: maskPhone(phone), durationMinutes },
+      "[OTP] Blocked for too many code requests",
+    );
 
     await sendWhatsAppMessage(
       phone,
-      `*${messageHeader}* 🛡️\nMultiple OTP requests detected. Account temporarily blocked for ${blockMsg}.\n\nتم اكتشاف طلبات متعددة لرمز التحقق. تم حظر الحساب مؤقتًا لمدة ${hours >= 1 ? (hours === 24 ? 'يوم' : 'ساعة') : 'دقائق'}.`,
+      `*${messageHeader}* 🛡️\nMultiple OTP requests detected. Account temporarily blocked for ${duration.en}.\n\n` +
+        `تم اكتشاف طلبات متعددة لرمز التحقق. تم حظر الحساب مؤقتًا لمدة ${duration.ar}.`,
+      { purpose: "otp" },
     );
-    return sendError(res, 403, `Too many requests. Blocked for ${blockMsg}.`);
+
+    return sendError(res, 403, `Too many requests. Blocked for ${duration.en}.`);
   }
 
   const otp = generateOTP();
   record.code = otp;
   record.expiresAt = now + otpExpiryMinutes * 60 * 1000;
   record.requests += 1;
-  record.lastFailedCode = null; // NEW: Reset failed code on new request
-  userStore[phone] = record;
+  record.lastFailedCode = null;
 
-  console.log(`[OTP Service] Generated OTP for ${phone}. Expires at: ${record.expiresAt} (in ${otpExpiryMinutes}m)`);
+  const validity = otpExpiryMinutes === 1 ? "1 minute" : `${otpExpiryMinutes} minutes`;
+  const validityAr = otpExpiryMinutes === 1 ? "دقيقة واحدة" : otpExpiryMinutes === 2 ? "دقيقتين" : `${otpExpiryMinutes} دقائق`;
 
   const sendResult = await sendWhatsAppMessage(
     phone,
-    `*${messageHeader}* 🔑\nYour login code is: *${otp}*\nValid for 2 minutes.\n\nرمز تسجيل الدخول الخاص بك هو: *${otp}*\nصالح لمدة دقيقتين.`,
+    `*${messageHeader}* 🔑\nYour login code is: *${otp}*\nValid for ${validity}.\n\n` +
+      `رمز تسجيل الدخول الخاص بك هو: *${otp}*\nصالح لمدة ${validityAr}.`,
+    // Logins are what a person is waiting on, so they may use channels that are
+    // reserved away from alert traffic.
+    { purpose: "otp" },
   );
 
   if (sendResult.success) {
-    userStore[phone] = record;
-    return res.json({ success: true, message: "OTP sent." });
-  } else {
-    if (sendResult.error === "NOT_ON_WHATSAPP") {
-      return sendError(res, 400, "The number is not on WhatsApp. Please create an account first.");
-    }
-    return sendError(res, 500, "Failed to send.");
+    logger.info(
+      { phone: maskPhone(phone), channel: sendResult.channel, expiresInMinutes: otpExpiryMinutes },
+      "[OTP] Code sent",
+    );
+    return res.json({ success: true, message: "OTP sent.", channel: sendResult.channel });
   }
+
+  if (sendResult.error === "NOT_ON_WHATSAPP") {
+    // Still counts as a request: otherwise a number that can never receive a
+    // code could be retried forever, free of the request limit.
+    record.code = null;
+    return sendError(res, 400, "The number is not on WhatsApp. Please create an account first.");
+  }
+
+  // A timeout is the one case where the code MAY have been delivered — the
+  // gateway just didn't answer in time. Invalidating it would strand a farmer
+  // holding a code that no longer works, so the code stays valid and they are
+  // told to enter it if it arrived.
+  if (sendResult.error === "TIMEOUT") {
+    record.requests = Math.max(0, record.requests - 1);
+    logger.warn({ phone: maskPhone(phone) }, "[OTP] Send timed out — keeping the code valid in case it arrived");
+    return sendError(
+      res,
+      503,
+      "الشبكة بطيئة حالياً. إذا وصلك الكود فأدخله، وإن لم يصل فأعد المحاولة.",
+    );
+  }
+
+  // Our fault, not theirs — the code never reached the user, so don't make them
+  // burn a request on it.
+  record.code = null;
+  record.requests = Math.max(0, record.requests - 1);
+
+  if (sendResult.error === "NO_CHANNEL_AVAILABLE") {
+    // 503, not 500: the backend reads 5xx as "the gateway is unhealthy", and
+    // this is exactly that — every sender number is down or saturated.
+    return sendError(res, 503, "Messaging channels are busy. Please try again shortly.");
+  }
+  return sendError(res, 500, "Failed to send.");
 };
 
 exports.verifyOtp = async (req, res) => {
   const { token, code } = req.body;
-  const ip = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-
   if (!token || !code) return sendError(res, 400, "Token and code required.");
 
-  let decoded;
-  try {
-    const secret = process.env.OTP_JWT_SECRET || process.env.JWT_SECRET || "default_otp_secret";
-    decoded = jwt.verify(token, secret);
-  } catch (err) {
-    console.error("[OTP Service] JWT Verification Error (Verify):", err.message);
-    return sendError(res, 401, "Invalid or expired authorization token.");
-  }
+  const { decoded, error } = decodeToken(token, "verifyOtp");
+  if (error) return sendError(res, 401, error);
 
   const phone = sanitizePhone(decoded.phone);
   if (!phone) return sendError(res, 400, "Invalid phone format in token.");
 
-  // NEW: OTP Length Validation
-  if (!code || code.toString().length !== 6) {
-    console.log(`[OTP Service] Invalid code length (${code?.toString()?.length}) for ${phone}. Skipping increment.`);
-    return sendError(res, 400, "OTP must be 6 digits.", false);
-  }
+  const codeStr = code.toString();
+  // A wrong-length entry is a typo, not an attempt — charging it against the
+  // attempt budget would let fat fingers lock someone out.
+  if (codeStr.length !== 6) return sendError(res, 400, "OTP must be 6 digits.", false);
 
-  // DYNAMIC CONFIG FROM BACKEND
-  const maxAttempts = decoded.maxAttempts || 3;
-  const maxAttemptsIp = decoded.maxAttemptsIp || 20;
-  const blockDurations = decoded.blockDurations || [30, 60, 1440];
-  const messageHeader = decoded.messageHeader || "ReNile";
+  const maxAttempts = decoded.maxAttempts || FALLBACKS.verifyOtp.maxAttempts;
+  const maxAttemptsIp = decoded.maxAttemptsIp || FALLBACKS.verifyOtp.maxAttemptsIp;
+  const blockDurations = decoded.blockDurations || FALLBACKS.verifyOtp.blockDurations;
+  const messageHeader = decoded.messageHeader || FALLBACKS.messageHeader;
 
+  const now = Date.now();
+  const ip = clientIpOf(req, decoded);
+  const ipRecord = ipRecordOf(ip);
   const record = userStore[phone];
-  const now = Date.now(); // Get current time
 
-  // 1. CHECK IP BLOCK
-  let ipRecord = ipStore[ip] || { attempts: 0, blockedUntil: null, blockCount: 0 };
-  if (ipRecord.blockedUntil && now < ipRecord.blockedUntil) {
-    const mins = Math.ceil((ipRecord.blockedUntil - now) / 60000);
-    return sendError(res, 403, `IP Blocked. Try again in ${mins} mins.`);
+  if (rejectIfBlocked(res, ipRecord, "IP blocked.")) return;
+  if (rejectIfBlocked(res, record, "This account is currently blocked for security reasons.")) return;
+
+  if (!record || !record.code) {
+    return sendError(res, 400, "Invalid or expired verification session.", false);
   }
-
-  // 2. CHECK PHONE BLOCK
-  if (record && record.blockedUntil && now < record.blockedUntil) {
-    const timeLeft = Math.ceil((record.blockedUntil - now) / 60000);
-    return sendError(
-      res,
-      403,
-      `This account is currently blocked for security reasons. Try again in ${timeLeft} minutes.`,
-    );
-  }
-
-  // --- EXISTING LOGIC ---
-  if (!record || !record.code) return sendError(res, 400, "Invalid or expired verification session.", false);
-
-  console.log(`[OTP Service] Verifying OTP for ${phone}. Now: ${now}, ExpiresAt: ${record.expiresAt}, Diff: ${record.expiresAt - now}ms`);
 
   if (now > record.expiresAt) {
-    console.warn(`[OTP Service] OTP expired for ${phone}.`);
+    logger.info({ phone: maskPhone(phone) }, "[OTP] Code expired");
     return sendError(res, 400, "OTP expired.", false);
   }
 
-
-  if (isSecureEqual(code.toString(), record.code)) {
+  if (isSecureEqual(codeStr, record.code)) {
     delete userStore[phone];
-    // Reset IP attempts on success
-    if (ipStore[ip]) delete ipStore[ip];
+    if (ip) delete ipStore[ip];
 
-    const token = jwt.sign({ phone, role: "user" }, process.env.JWT_SECRET, {
-      expiresIn: "30d",
-    });
-    return res.json({ success: true, token });
-  } else {
-    const codeStr = code.toString();
-    console.log(`[OTP Service] Wrong code comparison for ${phone}: Input='${codeStr}', LastFailed='${record.lastFailedCode}'`);
-
-    // ONLY increment attempts if they entered a DIFFERENT wrong code
-    if (record.lastFailedCode !== codeStr) {
-      record.attempts += 1;
-      ipRecord.attempts += 1; // Increment IP attempts too
-      record.lastFailedCode = codeStr; 
-      
-      console.log(`[OTP Service] NEW unique failure. Incrementing! Phone: ${record.attempts}/${maxAttempts}, IP: ${ipRecord.attempts}/${maxAttemptsIp}`);
-      
-      // CHECK IP LIMIT
-      if (ipRecord.attempts >= maxAttemptsIp) {
-        const blockIndex = Math.min(ipRecord.blockCount || 0, blockDurations.length - 1);
-        const durationMinutes = blockDurations[blockIndex];
-        ipRecord.blockedUntil = Date.now() + (durationMinutes * 60 * 1000);
-        ipRecord.blockCount = (ipRecord.blockCount || 0) + 1;
-        ipStore[ip] = ipRecord;
-        return sendError(res, 403, `IP Blocked for ${durationMinutes} mins.`);
-      }
-      ipStore[ip] = ipRecord;
-
-    } else {
-      console.log(`[OTP Service] DUPLICATE failure detected for ${phone}. Skipping increment.`);
-      return sendError(res, 400, "Invalid code.", false);
-    }
-
-    if (record.attempts >= maxAttempts) {
-      // Progressive Block Calculation (Circular: 2 -> 4 -> 6 -> 2...)
-      const blockIndex = (record.blockCount || 0) % blockDurations.length;
-      const durationMinutes = blockDurations[blockIndex];
-
-      const blockTimeMs = durationMinutes * 60 * 1000;
-
-      record.blockedUntil = Date.now() + blockTimeMs;
-      record.blockCount = (record.blockCount || 0) + 1;
-      userStore[phone] = record;
-
-      const hours = durationMinutes / 60;
-      const blockMsg = hours >= 1 
-        ? `${hours} hour${hours > 1 ? 's' : ''}` 
-        : `${durationMinutes} minutes`;
-
-      await sendWhatsAppMessage(
-        phone,
-        `*${messageHeader}* 🛡️\nToo many failed login attempts. Account blocked for ${blockMsg}.\n\nتم استنفاد محاولات تسجيل الدخول. تم حظر الحساب لمدة ${hours >= 1 ? (hours === 24 ? 'يوم' : 'ساعة') : 'دقائق'}.`,
-      );
-      return sendError(res, 403, `Blocked for ${blockMsg}.`);
-    }
-    userStore[phone] = record;
-    return sendError(res, 400, "Invalid code.");
+    logger.info({ phone: maskPhone(phone) }, "[OTP] Verified");
+    const sessionToken = jwt.sign({ phone, role: "user" }, config.jwtSecret, { expiresIn: "30d" });
+    return res.json({ success: true, token: sessionToken });
   }
+
+  // Re-submitting the SAME wrong code (a double-tap, a stale autofill) is one
+  // mistake, not several, so only a new wrong code costs an attempt.
+  if (record.lastFailedCode === codeStr) {
+    return sendError(res, 400, "Invalid code.", false);
+  }
+
+  record.attempts += 1;
+  record.lastFailedCode = codeStr;
+  if (ipRecord) ipRecord.attempts += 1;
+
+  logger.warn(
+    { phone: maskPhone(phone), attempts: record.attempts, maxAttempts },
+    "[OTP] Wrong code",
+  );
+
+  if (ipRecord && ipRecord.attempts >= maxAttemptsIp) {
+    const durationMinutes = applyBlock(ipRecord, blockDurations);
+    return sendError(res, 403, `IP Blocked for ${durationMinutes} mins.`);
+  }
+
+  if (record.attempts >= maxAttempts) {
+    const durationMinutes = applyBlock(record, blockDurations);
+    const duration = describeDuration(durationMinutes);
+
+    logger.warn(
+      { phone: maskPhone(phone), durationMinutes },
+      "[OTP] Blocked for too many failed attempts",
+    );
+
+    await sendWhatsAppMessage(
+      phone,
+      `*${messageHeader}* 🛡️\nToo many failed login attempts. Account blocked for ${duration.en}.\n\n` +
+        `تم استنفاد محاولات تسجيل الدخول. تم حظر الحساب لمدة ${duration.ar}.`,
+      { purpose: "otp" },
+    );
+
+    return sendError(res, 403, `Blocked for ${duration.en}.`);
+  }
+
+  return sendError(res, 400, "Invalid code.");
 };
 
 exports.notifyBlock = async (req, res) => {
   const { token, durationMinutes, reason } = req.body;
   if (!token) return sendError(res, 401, "Authorization token required.");
 
-  let decoded;
-  try {
-    const secret = process.env.OTP_JWT_SECRET || process.env.JWT_SECRET || "default_otp_secret";
-    decoded = jwt.verify(token, secret);
-  } catch (err) {
-    return sendError(res, 401, "Invalid or expired authorization token.");
-  }
+  const { decoded, error } = decodeToken(token, "notifyBlock");
+  if (error) return sendError(res, 401, error);
 
   const phone = sanitizePhone(decoded.phone);
   if (!phone) return sendError(res, 400, "Invalid phone format in token.");
 
-  const messageHeader = decoded.messageHeader || "ReNile";
-  const hours = durationMinutes / 60;
-  const blockMsg = hours >= 1 
-    ? `${hours} hour${hours > 1 ? 's' : ''}` 
-    : `${durationMinutes} minutes`;
+  const messageHeader = decoded.messageHeader || FALLBACKS.messageHeader;
+  const duration = describeDuration(Number(durationMinutes) || 0);
 
-  let arTimeStr = "";
-  if (hours >= 1) {
-    if (hours === 24) arTimeStr = "يوم كامل";
-    else if (hours === 1) arTimeStr = "ساعة واحدة";
-    else arTimeStr = `${hours} ساعة`;
-  } else {
-    if (durationMinutes === 1) arTimeStr = "دقيقة واحدة";
-    else if (durationMinutes === 2) arTimeStr = "دقيقتين";
-    else arTimeStr = `${durationMinutes} دقائق`;
-  }
-
-  console.log(`[OTP Service] notifyBlock request received for ${phone}. Reason: ${reason}, Duration: ${durationMinutes}m`);
-
-  const sent = await sendWhatsAppMessage(
+  const result = await sendWhatsAppMessage(
     phone,
-    `*${messageHeader}* 🛡️\nSecurity Alert: Your account has been temporarily blocked for ${blockMsg} due to suspicious activity.\n\nتنبيه أمني: تم حظر حسابك مؤقتًا لمدة ${arTimeStr} بسبب نشاط مشبوه.`,
+    `*${messageHeader}* 🛡️\nSecurity Alert: Your account has been temporarily blocked for ${duration.en} due to suspicious activity.\n\n` +
+      `تنبيه أمني: تم حظر حسابك مؤقتًا لمدة ${duration.ar} بسبب نشاط مشبوه.`,
+    { purpose: "otp" },
   );
 
-  console.log(`[OTP Service] notifyBlock WhatsApp status for ${phone}: ${sent ? 'SUCCESS' : 'FAILED'}`);
-  return res.json({ success: !!sent });
+  logger.info(
+    { phone: maskPhone(phone), reason, durationMinutes, success: result.success, channel: result.channel },
+    "[OTP] Block notification",
+  );
+
+  return respondToSend(res, result);
 };
 
 exports.sendNotification = async (req, res) => {
   const { token, message } = req.body;
   if (!token || !message) return sendError(res, 400, "Token and message required.");
 
-  let decoded;
-  try {
-    const secret = process.env.OTP_JWT_SECRET || process.env.JWT_SECRET || "default_otp_secret";
-    decoded = jwt.verify(token, secret);
-  } catch (err) {
-    console.error("[OTP Service] JWT Verification Error (sendNotification):", err.message);
-    return sendError(res, 401, "Invalid or expired authorization token.");
-  }
+  const { decoded, error } = decodeToken(token, "sendNotification");
+  if (error) return sendError(res, 401, error);
 
   const phone = sanitizePhone(decoded.phone);
   if (!phone) return sendError(res, 400, "Invalid phone format in token.");
 
-  console.log(`[OTP Service] sendNotification request received for ${phone}.`);
+  const result = await sendWhatsAppMessage(phone, message, { purpose: "alert" });
 
-  const sent = await sendWhatsAppMessage(phone, message);
+  logger.info(
+    { phone: maskPhone(phone), success: result.success, channel: result.channel, error: result.error },
+    "[OTP] Notification",
+  );
 
-  console.log(`[OTP Service] sendNotification WhatsApp status for ${phone}: ${sent ? 'SUCCESS' : 'FAILED'}`);
-  return res.json({ success: !!sent });
+  return respondToSend(res, result);
 };
 
-// Export the stores
+/**
+ * Turns a send result into a response.
+ *
+ * This used to answer `success: !!sendResult` — and sendResult is an object, so
+ * a failed send reported success. The backend's circuit breaker watches these
+ * status codes to decide whether the WhatsApp session is in trouble, so it was
+ * being told everything was fine no matter what.
+ */
+function respondToSend(res, result) {
+  if (result.success) return res.json({ success: true, channel: result.channel });
+
+  if (result.error === "NOT_ON_WHATSAPP") {
+    return sendError(res, 400, "The number is not on WhatsApp.");
+  }
+  if (result.error === "NO_CHANNEL_AVAILABLE" || result.error === "TIMEOUT") {
+    // Both are transient and retryable, and both are 5xx so the backend's
+    // circuit breaker still counts them against the gateway's health.
+    return sendError(res, 503, "Messaging channels are unavailable. Please try again shortly.");
+  }
+  return sendError(res, 502, "WhatsApp gateway failed to deliver the message.");
+}
+
 exports.userStore = userStore;
 exports.ipStore = ipStore;
