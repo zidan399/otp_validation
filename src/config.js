@@ -1,4 +1,8 @@
-require("dotenv").config();
+// quiet: dotenv v17 prints a promotional banner to STDOUT on load. That stream
+// carries pino's JSON logs, so the banner puts non-JSON lines into the log feed
+// and breaks anything parsing it — and under `node --test` it corrupts the test
+// runner's IPC channel, failing whole files at random.
+require("dotenv").config({ quiet: true });
 
 const { ChannelRegistry } = require("./services/channelRegistry");
 
