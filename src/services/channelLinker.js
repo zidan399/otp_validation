@@ -306,19 +306,59 @@ async function listAll() {
   const known = new Set(status.channels.map((channel) => channel.name));
 
   let unregistered = [];
+  // name -> { ownerJid, number, profileName }. Evolution reports the sender's own
+  // WhatsApp number and display name on the instance row, and this response
+  // already carries both — they were being read for the name and state and then
+  // discarded, which is why the admin panel's "Sender number" and "WhatsApp name"
+  // columns had nothing to show and rendered a dash for every row.
+  const identities = new Map();
+
   const res = await api.get("/instance/fetchInstances");
   if (res.status < 400 && Array.isArray(res.data)) {
-    unregistered = res.data
-      .map((item) => ({
-        name: item?.name ?? item?.instance?.instanceName ?? item?.instanceName,
-        state: item?.connectionStatus ?? item?.instance?.state ?? null,
-      }))
-      .filter((item) => item.name && !known.has(item.name));
+    for (const item of res.data) {
+      const name = item?.name ?? item?.instance?.instanceName ?? item?.instanceName;
+      if (!name) continue;
+
+      const ownerJid = item?.ownerJid ?? item?.instance?.owner ?? null;
+      // The JID's local part wins over Evolution's own `number` column. That
+      // column holds whatever was typed when the instance was linked, which is
+      // often the local format — one real row pairs number "xxxxxxxxxxx" with
+      // ownerJid "2xxxxxxxxxxx@s.whatsapp.net", i.e. the country code is
+      // missing and the value is not dialable. The JID is the identity WhatsApp
+      // itself reports, so it is the one to trust; `number` is only the
+      // fallback for older builds that do not send a JID.
+      const number = (ownerJid ? String(ownerJid).split("@")[0] : null) || item?.number || null;
+
+      // The account's own display name ("Ahmed Zidan") — what a farmer sees the
+      // message arrive from, as opposed to the instance name ("ReNile_1"), which
+      // is only our label for it. Sent as null rather than an empty string when
+      // WhatsApp has none, so the panel can tell "no name" from "blank name".
+      const rawProfileName = item?.profileName ?? item?.instance?.profileName ?? null;
+      const profileName = typeof rawProfileName === "string" && rawProfileName.trim() ? rawProfileName.trim() : null;
+
+      if (ownerJid || number || profileName) identities.set(name, { ownerJid, number, profileName });
+
+      if (!known.has(name)) {
+        unregistered.push({
+          name,
+          state: item?.connectionStatus ?? item?.instance?.state ?? null,
+        });
+      }
+    }
   } else {
     logger.warn({ status: res.status }, "[Linker] Could not list Evolution instances");
   }
 
-  return { ...status, unregistered };
+  // A channel with no match keeps its existing shape rather than gaining null
+  // fields: it is either not present in Evolution (the panel already flags
+  // that) or it lives on a different Evolution server — WHATSAPP_CHANNELS_JSON
+  // allows per-channel urls, and this lookup only covers the default one.
+  const channels = status.channels.map((channel) => {
+    const identity = identities.get(channel.name);
+    return identity ? { ...channel, ...identity } : channel;
+  });
+
+  return { ...status, channels, unregistered };
 }
 
 /** Brings an instance that already exists in Evolution under this service. */
