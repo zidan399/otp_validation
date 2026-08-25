@@ -56,21 +56,41 @@ function ipRecordOf(ip) {
   return ipStore[ip];
 }
 
-/** Renders a block duration for both languages. */
+/**
+ * Renders a block duration for English and Arabic, always both — this
+ * service's messages have never been language-selective (see AGENTS.md:
+ * "Messages are sent in English + Arabic"). Turkish is additive on top of
+ * that, appended only when the caller's token says so, so an existing
+ * English or Arabic farmer's message is untouched byte-for-byte.
+ */
 function describeDuration(durationMinutes) {
   const hours = durationMinutes / 60;
 
   if (hours >= 1) {
     const en = `${hours} hour${hours > 1 ? "s" : ""}`;
-    if (hours === 24) return { en, ar: "يوم كامل" };
-    if (hours === 1) return { en, ar: "ساعة واحدة" };
-    return { en, ar: `${hours} ساعات` };
+    const tr = hours === 1 ? "1 saat" : `${hours} saat`;
+    if (hours === 24) return { en, ar: "يوم كامل", tr: "1 tam gün" };
+    if (hours === 1) return { en, ar: "ساعة واحدة", tr };
+    return { en, ar: `${hours} ساعات`, tr };
   }
 
   const en = `${durationMinutes} minutes`;
-  if (durationMinutes === 1) return { en, ar: "دقيقة واحدة" };
-  if (durationMinutes === 2) return { en, ar: "دقيقتين" };
-  return { en, ar: `${durationMinutes} دقائق` };
+  const tr = durationMinutes === 1 ? "1 dakika" : `${durationMinutes} dakika`;
+  if (durationMinutes === 1) return { en, ar: "دقيقة واحدة", tr };
+  if (durationMinutes === 2) return { en, ar: "دقيقتين", tr };
+  return { en, ar: `${durationMinutes} دقائق`, tr };
+}
+
+/**
+ * Appends a Turkish segment to an English+Arabic message body, only when
+ * `lang` is exactly "tr". Any other value (including undefined, or a
+ * malformed one from an old/unrecognized token) leaves the message exactly
+ * as it always was — additive, never a replacement, so an English or Arabic
+ * farmer's message is provably unchanged (FR-011). Mirrors `resolveLang` on
+ * the Nojo_back side without importing across the repo boundary.
+ */
+function appendTurkish(baseMessage, lang, turkishLine) {
+  return lang === "tr" ? `${baseMessage}\n\n${turkishLine}` : baseMessage;
 }
 
 /**
@@ -113,6 +133,11 @@ exports.requestOtp = async (req, res) => {
   const blockDurations = decoded.blockDurations || FALLBACKS.requestOtp.blockDurations;
   const otpExpiryMinutes = decoded.otpExpiryMinutes || FALLBACKS.requestOtp.otpExpiryMinutes;
   const messageHeader = decoded.messageHeader || FALLBACKS.messageHeader;
+  // Only ever "tr" or absent — Nojo_back narrows this before signing the
+  // token (resolveLang), so an unrecognized value can't reach here. Treated
+  // as "not Turkish" regardless, since this file has no way to verify that
+  // narrowing happened.
+  const lang = decoded.lang;
 
   const now = Date.now();
   const ip = clientIpOf(req, decoded);
@@ -147,8 +172,12 @@ exports.requestOtp = async (req, res) => {
 
     await sendWhatsAppMessage(
       phone,
-      `*${messageHeader}* 🛡️\nMultiple OTP requests detected. Account temporarily blocked for ${duration.en}.\n\n` +
-        `تم اكتشاف طلبات متعددة لرمز التحقق. تم حظر الحساب مؤقتًا لمدة ${duration.ar}.`,
+      appendTurkish(
+        `*${messageHeader}* 🛡️\nMultiple OTP requests detected. Account temporarily blocked for ${duration.en}.\n\n` +
+          `تم اكتشاف طلبات متعددة لرمز التحقق. تم حظر الحساب مؤقتًا لمدة ${duration.ar}.`,
+        lang,
+        `Birden fazla OTP isteği tespit edildi. Hesap ${duration.tr} süreyle geçici olarak engellendi.`,
+      ),
       { purpose: "otp" },
     );
 
@@ -164,10 +193,16 @@ exports.requestOtp = async (req, res) => {
   const validity = otpExpiryMinutes === 1 ? "1 minute" : `${otpExpiryMinutes} minutes`;
   const validityAr = otpExpiryMinutes === 1 ? "دقيقة واحدة" : otpExpiryMinutes === 2 ? "دقيقتين" : `${otpExpiryMinutes} دقائق`;
 
+  const validityTr = otpExpiryMinutes === 1 ? "1 dakika" : `${otpExpiryMinutes} dakika`;
+
   const sendResult = await sendWhatsAppMessage(
     phone,
-    `*${messageHeader}* 🔑\nYour login code is: *${otp}*\nValid for ${validity}.\n\n` +
-      `رمز تسجيل الدخول الخاص بك هو: *${otp}*\nصالح لمدة ${validityAr}.`,
+    appendTurkish(
+      `*${messageHeader}* 🔑\nYour login code is: *${otp}*\nValid for ${validity}.\n\n` +
+        `رمز تسجيل الدخول الخاص بك هو: *${otp}*\nصالح لمدة ${validityAr}.`,
+      lang,
+      `Giriş kodunuz: *${otp}*\n${validityTr} boyunca geçerli.`,
+    ),
     // Logins are what a person is waiting on, so they may use channels that are
     // reserved away from alert traffic.
     { purpose: "otp" },
