@@ -188,6 +188,7 @@ exports.requestOtp = async (req, res) => {
   record.code = otp;
   record.expiresAt = now + otpExpiryMinutes * 60 * 1000;
   record.requests += 1;
+  record.attempts = 0;
   record.lastFailedCode = null;
 
   const validity = otpExpiryMinutes === 1 ? "1 minute" : `${otpExpiryMinutes} minutes`;
@@ -268,7 +269,6 @@ exports.verifyOtp = async (req, res) => {
   const maxAttempts = decoded.maxAttempts || FALLBACKS.verifyOtp.maxAttempts;
   const maxAttemptsIp = decoded.maxAttemptsIp || FALLBACKS.verifyOtp.maxAttemptsIp;
   const blockDurations = decoded.blockDurations || FALLBACKS.verifyOtp.blockDurations;
-  const messageHeader = decoded.messageHeader || FALLBACKS.messageHeader;
 
   const now = Date.now();
   const ip = clientIpOf(req, decoded);
@@ -317,22 +317,13 @@ exports.verifyOtp = async (req, res) => {
   }
 
   if (record.attempts >= maxAttempts) {
-    const durationMinutes = applyBlock(record, blockDurations);
-    const duration = describeDuration(durationMinutes);
-
-    logger.warn(
-      { phone: maskPhone(phone), durationMinutes },
-      "[OTP] Blocked for too many failed attempts",
-    );
-
-    await sendWhatsAppMessage(
-      phone,
-      `*${messageHeader}* 🛡️\nToo many failed login attempts. Account blocked for ${duration.en}.\n\n` +
-        `تم استنفاد محاولات تسجيل الدخول. تم حظر الحساب لمدة ${duration.ar}.`,
-      { purpose: "otp" },
-    );
-
-    return sendError(res, 403, `Blocked for ${duration.en}.`);
+    // A wrong code never locks the phone: the code is cancelled and the
+    // farmer requests a new one. (The IP branch above is unchanged.)
+    record.code = null;
+    record.expiresAt = null;
+    record.attempts = 0;
+    record.lastFailedCode = null;
+    return sendError(res, 400, "Too many wrong codes. This code was cancelled — request a new one.", true);
   }
 
   return sendError(res, 400, "Invalid code.");

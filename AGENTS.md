@@ -9,7 +9,7 @@ and per-number rate limiting live. Requires a running Evolution API.
 ```bash
 npm start       # node server.js
 npm run dev     # node --watch server.js
-npm test        # node --test test/
+npm test        # node --test
 ```
 
 ## Architecture
