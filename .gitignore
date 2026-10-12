@@ -2,6 +2,10 @@ node_modules
 dist
 build
 
+# Runtime state: which sender number each farmer is assigned to, and which
+# senders were linked through the admin panel rather than declared in .env.
+data/
+
 GEMINI.md
 *.log
 *.env

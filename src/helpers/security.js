@@ -1,7 +1,11 @@
 const crypto = require("crypto");
 
-exports.generateOTP = () =>
-  Math.floor(100000 + Math.random() * 900000).toString();
+/**
+ * Six-digit login code. Uses crypto.randomInt rather than Math.random: this
+ * value is the only thing between a phone number and an account, and
+ * Math.random is predictable from earlier outputs.
+ */
+exports.generateOTP = () => crypto.randomInt(100000, 1000000).toString();
 
 exports.isSecureEqual = (userInput, storedCode) => {
   if (!userInput || !storedCode || userInput.length !== storedCode.length)
