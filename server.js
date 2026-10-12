@@ -85,12 +85,15 @@ setInterval(() => {
 // the first message doesn't get routed to a channel that is already logged out.
 startChannelMonitor();
 
-const server = app.listen(config.port, () =>
+// Express 5 hands listen errors (EADDRINUSE) to this callback instead of
+// throwing, so without the check a taken port logs "listening" and exits 0.
+const server = app.listen(config.port, (err) => {
+  if (err) throw err;
   logger.info(
     { port: config.port, channels: config.channels.length },
     `Auth server listening on http://localhost:${config.port}`,
-  ),
-);
+  );
+});
 
 // Flush the farmer-to-number map before exiting, so a restart doesn't move
 // farmers whose assignment was made in the last couple of seconds.
