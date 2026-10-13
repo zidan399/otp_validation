@@ -18,9 +18,10 @@ const { ChannelAssignments } = require("./channelAssignments");
  * the person reading it and what a spam ring looks like to WhatsApp, so the
  * rotation is across farmers, not across each farmer's messages.
  *
- * Assignment happens on first contact and goes to the number carrying the
- * fewest farmers, so a group of new farmers spreads evenly — five farmers over
- * three numbers land 2 / 2 / 1 rather than all on whichever number was free.
+ * Assignment happens on first contact and takes the numbers in turn, so a
+ * group of new farmers spreads evenly — five farmers over three numbers land
+ * 2 / 2 / 1. Past load is not repaid: a number that was down and carries fewer
+ * farmers gets its equal share of new ones, not all of them.
  *
  * A farmer is moved to a different number only when their own number cannot
  * deliver: disconnected, resting after repeated failures, or over its daily cap.
@@ -41,6 +42,8 @@ class ChannelPool {
 
     this.probeTimer = null;
     this.assignments = new ChannelAssignments();
+    /** Rising counter stamped on a number each time it takes a new farmer. */
+    this.assignSeq = 0;
 
     logger.info(
       {
@@ -159,6 +162,7 @@ class ChannelPool {
         // Reserve it now. Two concurrent callers therefore see different
         // numbers rather than both writing to the same one.
         chosen.lastSentAt = Date.now();
+        chosen.busyUntil = Date.now() + config.requestTimeoutMs;
         return chosen;
       }
 
@@ -180,6 +184,7 @@ class ChannelPool {
     if (!entry) return;
 
     this.rollDay(entry);
+    entry.busyUntil = 0;
     entry.lastSentAt = Date.now();
     entry.lastSuccessAt = Date.now();
     entry.sentToday += 1;
@@ -203,6 +208,7 @@ class ChannelPool {
     const entry = this.byName(channel.name);
     if (!entry) return;
 
+    entry.busyUntil = 0;
     entry.lastSentAt = Date.now();
     entry.totalFailed += 1;
     entry.lastError = reason;
@@ -425,6 +431,15 @@ class ChannelPool {
     const assigned = this.byName(this.assignments.get(key));
 
     if (assigned && !exclude.includes(assigned.name) && this.isUsable(assigned, purpose)) {
+      const lighter = this.lighterNumber(assigned, purpose, exclude);
+      if (lighter) {
+        this.assignments.set(key, lighter.name);
+        logger.info(
+          { phone: maskPhone(phone), from: assigned.name, to: lighter.name },
+          `[Channels] Rebalanced ${maskPhone(phone)} from '${assigned.name}' to '${lighter.name}'`,
+        );
+        return lighter;
+      }
       // Returned even when busy: the caller waits out its quiet gap rather than
       // switching the farmer to a different sender.
       this.assignments.touch(key);
@@ -434,7 +449,8 @@ class ChannelPool {
     const candidates = this.eligible(purpose).filter((channel) => !exclude.includes(channel.name));
     if (candidates.length === 0) return null;
 
-    const next = this.leastLoaded(candidates);
+    const next = this.nextInTurn(candidates);
+    next.lastAssignedSeq = ++this.assignSeq;
     this.assignments.set(key, next.name);
 
     if (assigned) {
@@ -452,26 +468,44 @@ class ChannelPool {
     return next;
   }
 
-  /** Whichever usable number has rested longest. Used when stickiness is off. */
+  /**
+   * Whichever usable number has rested longest (login codes, or stickiness off).
+   * A number still waiting on its last send is skipped while another is idle,
+   * so one slow or stuck number never holds codes the others could send.
+   */
   pickFree(purpose, exclude) {
     const candidates = this.eligible(purpose).filter((channel) => !exclude.includes(channel.name));
     if (candidates.length === 0) return null;
-    return candidates.reduce((best, channel) => (channel.lastSentAt < best.lastSentAt ? channel : best));
+    const idle = candidates.filter((channel) => !(channel.busyUntil > Date.now()));
+    return (idle.length ? idle : candidates).reduce((best, channel) =>
+      channel.lastSentAt < best.lastSentAt ? channel : best,
+    );
   }
 
   /**
-   * The number carrying the fewest farmers, so new farmers spread evenly instead
-   * of piling onto whichever number happened to be free. Ties break on the
-   * longest-rested number.
+   * When the farmer's own number carries more than its fair share (above the
+   * average), the emptiest number to move them to; otherwise null. Called at
+   * each message, so an overloaded number sheds farmers one by one and stops
+   * once the numbers are even (within one farmer) — only the excess ever
+   * moves, and a moved farmer stays put. Without it a number that was down keeps its
+   * small share forever while the others carry the rest every day.
    */
-  leastLoaded(candidates) {
+  lighterNumber(assigned, purpose, exclude) {
+    const candidates = this.eligible(purpose).filter((channel) => !exclude.includes(channel.name));
+    if (candidates.length < 2) return null;
+    // ponytail: counts() walks every assignment on each message; cache it if farmers reach ~100k.
     const counts = this.assignments.counts();
-    return candidates.reduce((best, channel) => {
-      const load = counts[channel.name] || 0;
-      const bestLoad = counts[best.name] || 0;
-      if (load !== bestLoad) return load < bestLoad ? channel : best;
-      return channel.lastSentAt < best.lastSentAt ? channel : best;
-    });
+    const load = (channel) => counts[channel.name] || 0;
+    const average = candidates.reduce((sum, channel) => sum + load(channel), 0) / candidates.length;
+    if (load(assigned) <= average) return null;
+    const lightest = candidates.reduce((best, channel) => (load(channel) < load(best) ? channel : best));
+    // A gap of one would only swap which number is heavier.
+    return load(assigned) - load(lightest) >= 2 ? lightest : null;
+  }
+
+  /** The number that took a new farmer longest ago, so new farmers go round in turn. */
+  nextInTurn(candidates) {
+    return candidates.reduce((best, channel) => (channel.lastAssignedSeq < best.lastAssignedSeq ? channel : best));
   }
 
   /**
@@ -547,6 +581,10 @@ function freshChannel(channel) {
     ...channel,
     /** Set at acquire time, not send time, so concurrent callers can't both grab one number. */
     lastSentAt: 0,
+    /** A send is in flight until this time (cleared when it reports back). */
+    busyUntil: 0,
+    /** When this number last took a new farmer (ChannelPool.assignSeq). */
+    lastAssignedSeq: 0,
     /** Distinct from lastSentAt, which also moves on reservation and failure. */
     lastSuccessAt: 0,
     sentToday: 0,

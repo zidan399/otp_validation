@@ -105,6 +105,71 @@ test("login codes are not pinned: a busy farmer's code goes out on an idle numbe
   assert.equal(pool.assignments.size(), 0, "no login code creates an assignment");
 });
 
+test("new farmers take the numbers in turn, without repaying a number's past load", async () => {
+  // A number that was down comes back carrying fewer farmers. It gets its equal
+  // share of the next ones, not all of them until it has caught up.
+  const pool = loadPool({ WHATSAPP_CHANNELS: "a,b,c", WHATSAPP_CHANNEL_MIN_GAP_MS: "0" });
+  for (const channel of pool.channels) channel.connected = true;
+  for (let i = 0; i < 15; i += 1) pool.assignments.set(`alert:20100000${i}`, "a");
+  for (let i = 0; i < 15; i += 1) pool.assignments.set(`alert:20200000${i}`, "b");
+  for (let i = 0; i < 2; i += 1) pool.assignments.set(`alert:20300000${i}`, "c");
+
+  const taken = { a: 0, b: 0, c: 0 };
+  for (let i = 0; i < 9; i += 1) taken[pool.assignedChannel("alert", `20900000${i}`, []).name] += 1;
+  assert.deepEqual(taken, { a: 3, b: 3, c: 3 });
+});
+
+test("an overloaded number sheds only its excess farmers, who then stay put", async () => {
+  // 50 / 40 / 10 is the 500 / 400 / 100 case scaled down: one number was down
+  // for a while and the others kept its farmers.
+  const pool = loadPool({ WHATSAPP_CHANNELS: "a,b,c", WHATSAPP_CHANNEL_MIN_GAP_MS: "0" });
+  for (const channel of pool.channels) channel.connected = true;
+  const farmers = [];
+  for (const [name, n] of [["a", 50], ["b", 40], ["c", 10]]) {
+    for (let i = 0; i < n; i += 1) {
+      const phone = `20${name.charCodeAt(0)}${String(i).padStart(6, "0")}`;
+      pool.assignments.set(phone, name);
+      farmers.push(phone);
+    }
+  }
+
+  // One alert to every farmer.
+  const before = new Map(farmers.map((phone) => [phone, pool.assignments.get(phone)]));
+  for (const phone of farmers) pool.assignedChannel("alert", phone, []);
+
+  const counts = pool.assignments.counts();
+  const loads = ["a", "b", "c"].map((name) => counts[name]);
+  assert.ok(Math.max(...loads) - Math.min(...loads) <= 1, `numbers end even: ${loads}`);
+  const moved = farmers.filter((phone) => pool.assignments.get(phone) !== before.get(phone)).length;
+  assert.ok(moved <= 24, `only the excess moves, not everyone: ${moved} moved`);
+
+  // A second day of alerts moves nobody.
+  const settled = new Map(farmers.map((phone) => [phone, pool.assignments.get(phone)]));
+  for (const phone of farmers) pool.assignedChannel("alert", phone, []);
+  assert.ok(farmers.every((phone) => pool.assignments.get(phone) === settled.get(phone)));
+});
+
+test("a number still sending is passed over for login codes while another is idle", async () => {
+  // One slow or stuck number must not hold codes the others could send now.
+  const pool = loadPool({ WHATSAPP_CHANNELS: "a,b,c", WHATSAPP_CHANNEL_MIN_GAP_MS: "0" });
+  for (const channel of pool.channels) channel.connected = true;
+
+  const stuck = await pool.acquire({ purpose: "otp", phone: "201000000001" }); // never reports back
+  for (let i = 2; i <= 7; i += 1) {
+    const channel = await pool.acquire({ purpose: "otp", phone: `20100000000${i}` });
+    assert.notEqual(channel.name, stuck.name, "codes go to the idle numbers");
+    pool.reportSuccess(channel);
+  }
+
+  pool.reportSuccess(stuck);
+  const used = new Set();
+  for (let i = 0; i < 3; i += 1) {
+    const channel = await pool.acquire({ purpose: "otp", phone: `2019000000${i}` });
+    used.add(channel.name);
+  }
+  assert.ok(used.has(stuck.name), "once it reports back it is used again");
+});
+
 test("a recipient is never served by a second number while theirs works", async () => {
   const pool = loadPool({ WHATSAPP_CHANNELS: "a,b,c,d", WHATSAPP_CHANNEL_MIN_GAP_MS: "0" });
   const phone = "201234567890";

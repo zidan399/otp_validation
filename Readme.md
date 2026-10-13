@@ -47,8 +47,14 @@ assigned one sender number on first contact and keeps it — hearing the same ki
 of message from several numbers reads as a scam to the farmer and as a spam ring
 to WhatsApp, and reports are the fastest route to a ban.
 
-New farmers go to the number carrying the fewest of them, so five farmers over
-three numbers land **2 / 2 / 1** rather than all on whichever number was free.
+New farmers take the numbers in turn, so five farmers over three numbers land
+**2 / 2 / 1**. Past load is not repaid: a number that was down and carries fewer
+farmers gets its equal share of new ones, not all of them. Instead, a number
+carrying more than the average hands farmers, one per message, to the emptiest
+number until the counts are even; only the excess moves, and only once.
+
+Login codes skip a number that is still waiting on its last send while another
+is idle, so one slow or stuck number never holds codes the others could send.
 
 A farmer is moved to another number only when theirs genuinely cannot deliver —
 disconnected, resting after repeated failures, or over its daily cap. If it is
