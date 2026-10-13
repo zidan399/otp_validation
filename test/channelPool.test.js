@@ -81,12 +81,28 @@ test("5 recipients over 3 channels distribute 2/2/1", async () => {
 
   await Promise.all(
     ["201000001", "201000002", "201000003", "201000004", "201000005"].map((phone) =>
-      pool.acquire({ purpose: "otp", phone }),
+      pool.acquire({ purpose: "alert", phone }),
     ),
   );
 
   const load = Object.values(pool.assignments.counts()).sort();
   assert.deepEqual(load, [1, 2, 2], "new recipients go to the least-loaded number");
+});
+
+test("login codes are not pinned: a busy farmer's code goes out on an idle number", async () => {
+  // Pinning made farmers on one number queue 5-7s apart while the other senders
+  // sat idle. A code is read once, so any ReNile number may send it.
+  const pool = loadPool({ WHATSAPP_CHANNELS: "a,b,c", WHATSAPP_ACQUIRE_TIMEOUT_MS: "500" });
+  for (const channel of pool.channels) channel.connected = true;
+
+  const used = [];
+  for (let i = 0; i < 3; i += 1) {
+    const channel = await pool.acquire({ purpose: "otp", phone: "201234567890" });
+    assert.ok(channel, `code ${i + 1} should go out at once on a rested number`);
+    used.push(channel.name);
+  }
+  assert.deepEqual(used.sort(), ["a", "b", "c"]);
+  assert.equal(pool.assignments.size(), 0, "no login code creates an assignment");
 });
 
 test("a recipient is never served by a second number while theirs works", async () => {

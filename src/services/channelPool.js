@@ -11,7 +11,9 @@ const { ChannelAssignments } = require("./channelAssignments");
  * globally — with five numbers the service sustains five times the throughput
  * while each individual number still looks as calm as before.
  *
- * Each farmer is assigned ONE sender number and keeps it. Receiving the same
+ * Login codes skip this and go out on whichever number has rested longest.
+ *
+ * For alerts, each farmer is assigned ONE sender number and keeps it. Receiving the same
  * kind of message from several different numbers is what a scam looks like to
  * the person reading it and what a spam ring looks like to WhatsApp, so the
  * rotation is across farmers, not across each farmer's messages.
@@ -129,7 +131,10 @@ class ChannelPool {
    */
   async acquire({ purpose = "alert", phone = "", exclude = [] } = {}) {
     const deadline = Date.now() + config.acquireTimeoutMs;
-    const sticky = config.stickySender && Boolean(phone);
+    // Login codes are not sticky: a code is read once and never saved as a
+    // contact, and pinning made several farmers on one number queue behind each
+    // other while other senders sat idle. Alerts keep their farmer's number.
+    const sticky = config.stickySender && Boolean(phone) && purpose !== "otp";
 
     for (;;) {
       const chosen = sticky

@@ -35,9 +35,14 @@ With five numbers each one sends at a fifth of the rate, and one number going
 down no longer stops logins. The minimum gap is enforced **per number**, so N
 numbers sustain N times the throughput while each stays as calm as it was.
 
-### One farmer, one number
+### One farmer, one number (alerts only)
 
-The rotation is across *farmers*, not across each farmer's messages. A farmer is
+Login codes are **not** pinned: each goes out on whichever number has rested
+longest, so a burst of logins uses every connected number at once. A code is
+read once and never saved as a contact, and pinning made farmers on the same
+number queue behind each other while other numbers sat idle.
+
+For alerts, the rotation is across *farmers*, not across each farmer's messages. A farmer is
 assigned one sender number on first contact and keeps it — hearing the same kind
 of message from several numbers reads as a scam to the farmer and as a spam ring
 to WhatsApp, and reports are the fastest route to a ban.
