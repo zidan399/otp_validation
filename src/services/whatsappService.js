@@ -106,6 +106,9 @@ async function dispatch(channel, phone, text, timeoutMs = config.requestTimeoutM
     number: phone,
     options: { delay: 1200, presence: "composing" },
     text,
+    // No link card: every Nojo message ends with a nojo.ai link, and WhatsApp
+    // drew the site's whole logo above the text as a huge preview.
+    linkPreview: false,
   };
 
   try {
