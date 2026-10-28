@@ -86,7 +86,7 @@ farmer two senders, so the assignment key includes the purpose
   Nojo_back and arrives in the token. Values here are fallbacks for old tokens.
 - Phone sanitization handles Egyptian formats (`sanitizePhone`)
 - OTP comparison uses `crypto.timingSafeEqual`; codes come from `crypto.randomInt`
-- Messages are sent in English + Arabic
+- Messages are sent in English + Arabic, except the login code, which uses the token's `lang` (en/ar/tr) and falls back to English + Arabic
 - Log phone numbers only through `maskPhone`
 
 ## Relationship to Nojo_back

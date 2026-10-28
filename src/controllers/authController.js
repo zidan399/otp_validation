@@ -191,19 +191,21 @@ exports.requestOtp = async (req, res) => {
   record.attempts = 0;
   record.lastFailedCode = null;
 
-  const validity = otpExpiryMinutes === 1 ? "1 minute" : `${otpExpiryMinutes} minutes`;
-  const validityAr = otpExpiryMinutes === 1 ? "دقيقة واحدة" : otpExpiryMinutes === 2 ? "دقيقتين" : `${otpExpiryMinutes} دقائق`;
-
-  const validityTr = otpExpiryMinutes === 1 ? "1 dakika" : `${otpExpiryMinutes} dakika`;
-
+  // One language, the one the farmer picked in the app. A token without a
+  // known lang (older callers) keeps the old English + Arabic pair.
+  const codeLine = {
+    en: "is your verification code. For your security, do not share this code.",
+    ar: "هو رمز التحقق الخاص بك. حفاظًا على أمانك، لا تشارك هذا الرمز مع أحد.",
+    tr: "doğrulama kodunuzdur. Güvenliğiniz için bu kodu kimseyle paylaşmayın.",
+  };
+  const body = Object.hasOwn(codeLine, lang) ? codeLine[lang] : `${codeLine.en}\n${codeLine.ar}`;
+  const signature = messageHeader === "ReNile" ? "ReNile" : `${messageHeader} by ReNile`;
   const sendResult = await sendWhatsAppMessage(
     phone,
-    appendTurkish(
-      `*${messageHeader}* 🔑\nYour login code is: *${otp}*\nValid for ${validity}.\n\n` +
-        `رمز تسجيل الدخول الخاص بك هو: *${otp}*\nصالح لمدة ${validityAr}.`,
-      lang,
-      `Giriş kodunuz: *${otp}*\n${validityTr} boyunca geçerli.`,
-    ),
+    // The code alone on the first line. WhatsApp aligns the whole message by
+    // its language, so in Arabic every line sits on the right; a left-to-right
+    // mark was tried and ignored.
+    `*${otp}*\n${body}\n\n_${signature}_`,
     // Logins are what a person is waiting on, so they may use channels that are
     // reserved away from alert traffic.
     { purpose: "otp" },
